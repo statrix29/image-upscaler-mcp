@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Local, single-image AI upscaling for macOS."""
+
+import argparse
+from collections import deque
+from fractions import Fraction
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent
+ENGINE = ROOT / "bin/upscayl-bin"
+SRGB = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+MODELS = {
+    "standard": "upscayl-standard-4x",
+    "lite": "upscayl-lite-4x",
+    "digital-art": "digital-art-4x",
+    "high-fidelity": "high-fidelity-4x",
+    "remacri": "remacri-4x",
+    "ultrasharp": "ultrasharp-4x",
+    "ultramix-balanced": "ultramix-balanced-4x",
+}
+PRESETS = {"1080p": (1920, 1080), "1440p": (2560, 1440),
+           "4k": (3840, 2160), "8k": (7680, 4320)}
+INPUTS = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif", ".tif", ".tiff"}
+OUTPUTS = {".png", ".jpg", ".jpeg", ".webp"}
+# The backend allocates a full native 4× raster in addition to its GPU tiles.
+# Split large inputs to bound that allocation and its PNG encoder buffers.
+BAND_PIXELS = 8_000_000
+OVERLAP = 32
+
+
+def positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return number
+
+
+def scale_factor(value):
+    value = value.lower().removesuffix("x")
+    if not re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)", value) or Fraction(value) <= 0:
+        raise argparse.ArgumentTypeError("use a positive scale such as 2 or 1.5")
+    return Fraction(value)
+
+
+def dimensions(value):
+    value = value.lower()
+    if value in PRESETS:
+        return PRESETS[value]
+    pair = re.fullmatch(r"([1-9]\d*)[x×]([1-9]\d*)", value)
+    if not pair:
+        raise argparse.ArgumentTypeError("use WIDTHxHEIGHT, 1080p, 1440p, 4k, or 8k")
+    return tuple(map(int, pair.groups()))
+
+
+def aspect_ratio(value):
+    pair = re.fullmatch(r"([1-9]\d*):([1-9]\d*)", value)
+    if not pair:
+        raise argparse.ArgumentTypeError("use a ratio such as 16:9 or 3:4")
+    return Fraction(*map(int, pair.groups()))
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description="Upscale a local image on your Mac's GPU.",
+        epilog='Example: upscale "photo.heic" --width 3000 --aspect 3:2 --fit crop -o print.jpg')
+    parser.add_argument("image", type=Path, help="PNG, JPEG, WebP, HEIC, HEIF, or TIFF image")
+    parser.add_argument("-o", "--output", type=Path, help="PNG (default), JPEG, or WebP output path")
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument("--scale", type=scale_factor, metavar="N", help="multiply both dimensions (default 4)")
+    size.add_argument("--size", "--resolution", type=dimensions, metavar="WxH",
+                      help="exact canvas in pixels, or 1080p, 1440p, 4k, 8k")
+    size.add_argument("--width", type=positive, metavar="PX", help="set width and calculate height")
+    size.add_argument("--height", type=positive, metavar="PX", help="set height and calculate width")
+    parser.add_argument("--aspect", "--aspect-ratio", type=aspect_ratio, metavar="W:H",
+                        help="canvas shape (default uses the image shape)")
+    parser.add_argument("--fit", choices=("pad", "crop"), default="pad",
+                        help="center and pad (default) or center and crop to fill")
+    parser.add_argument("--background", choices=("white", "black", "transparent"), default="white",
+                        help="padding color and JPEG matte (default white)")
+    parser.add_argument("--model", choices=MODELS, default="standard",
+                        help="AI model (default standard for photos, lite for speed)")
+    parser.add_argument("--dpi", type=positive, help="set PNG or JPEG print density in pixels per inch")
+    parser.add_argument("--quality", type=positive, help="JPEG or WebP quality from 1 to 100 (default 92)")
+    parser.add_argument("--force", action="store_true", help="replace an existing output file")
+    return parser.parse_args()
+
+
+def pixels(value):
+    return max(1, math.floor(value + Fraction(1, 2)))
+
+
+def target_size(args, width, height):
+    ratio = args.aspect or Fraction(width, height)
+    if args.size:
+        if args.aspect and Fraction(*args.size) != ratio:
+            raise ValueError("--size and --aspect specify different shapes")
+        return args.size
+    if args.width:
+        return args.width, pixels(args.width / ratio)
+    if args.height:
+        return pixels(args.height * ratio), args.height
+    # With an explicit ratio, inscribe the canvas in the scaled source bounds.
+    scale = args.scale or 4
+    box_w, box_h = width * scale, height * scale
+    return pixels(min(box_w, box_h * ratio)), pixels(min(box_h, box_w / ratio))
+
+
+def geometry(size):
+    return f"{size[0]}x{size[1]}"
+
+
+def magick(*args):
+    # ImageMagick can spill its pixel cache to disk for large camera images.
+    cmd = ["magick", "-limit", "memory", "1GiB", "-limit", "map", "2GiB", *args]
+    result = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "ImageMagick could not process the image")
+    return result.stdout.strip()
+
+
+def run_model(image, output, model):
+    name = MODELS[model]
+    cmd = [ENGINE, "-i", image, "-o", output, "-m", ROOT / "models", "-n", name,
+           "-z", "4", "-t", "128", "-j", "1:1:1", "-c", "1"]
+    output.unlink(missing_ok=True)  # Each section must produce a fresh raster.
+    diagnostics = deque(maxlen=16)
+    interactive = sys.stderr.isatty()
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace") as process:
+        for line in process.stdout:
+            line = line.strip()
+            if re.fullmatch(r"\d+(\.\d+)?%?", line):
+                if interactive:
+                    print(f"\r  {line.rstrip('%')}%  ", file=sys.stderr, end="", flush=True)
+                continue
+            device = re.match(r"\[\d+ (.+?)\]\s+queueC=", line)
+            if device:
+                print(f"Running on {device[1]}", file=sys.stderr, flush=True)
+            if line:
+                diagnostics.append(line)
+        status = process.wait()
+    if interactive:
+        print(file=sys.stderr)
+    if status or not output.is_file():
+        raise ValueError(f"Upscayl could not produce an image (exit {status})\n" +
+                         "\n".join(diagnostics))
+
+
+def enhance(image, size, model, work):
+    for ext in (".param", ".bin"):
+        weights = ROOT / "models" / (MODELS[model] + ext)
+        if not weights.is_file():
+            raise ValueError(f"missing model file: {weights}")
+    enhanced = work / "enhanced.png"
+    width, height = size
+    if width * height <= BAND_PIXELS:
+        run_model(image, enhanced, model)
+        return enhanced
+
+    # Keep neighboring source pixels as context and discard their overlap after inference.
+    horizontal = width >= height
+    length, cross = sorted(size, reverse=True)
+    step = max(1, BAND_PIXELS // cross - 2 * OVERLAP)
+    bands = []
+    for start in range(0, length, step):
+        stop = min(start + step, length)
+        lo, hi = max(0, start - OVERLAP), min(length, stop + OVERLAP)
+        span, core, offset = hi - lo, (stop - start) * 4, (start - lo) * 4
+        if horizontal:
+            region, trim = f"{span}x{height}+{lo}+0", f"{core}x{height*4}+{offset}+0"
+        else:
+            region, trim = f"{width}x{span}+0+{lo}", f"{width*4}x{core}+0+{offset}"
+        print(f"Processing section {len(bands)+1} of {math.ceil(length/step)}", file=sys.stderr)
+        part = work / "part.png"
+        magick(image, "-crop", region, "+repage", part)
+        run_model(part, enhanced, model)
+        band = work / f"band-{start}.miff"
+        magick(enhanced, "-crop", trim, "+repage", "-depth", "8", band)
+        bands.append(band)
+    joined = work / "enhanced.miff"
+    magick(*bands, "+append" if horizontal else "-append", "-depth", "8", joined)
+    return joined
+
+
+def process(args, work):
+    source = args.image.expanduser().absolute()
+    if not source.is_file():
+        raise ValueError(f"input file does not exist: {source}")
+    if source.suffix.lower() not in INPUTS:
+        raise ValueError("supported inputs are PNG, JPEG, WebP, HEIC, HEIF, and TIFF")
+    if not shutil.which("magick"):
+        raise ValueError("ImageMagick is required. Install it with 'brew install imagemagick'.")
+
+    # A known local name also protects literal brackets and other filename characters
+    # from ImageMagick's frame-selection syntax.
+    local = work / ("source" + source.suffix.lower())
+    local.symlink_to(source)
+    first = f"{local}[0]"
+    header = magick("-ping", first, "-format", "%w %h %[orientation]|%[profiles]", "info:")
+    metadata, profiles = header.split("|", 1)
+    w, h, orientation = metadata.split()
+    width, height = int(w), int(h)
+    if orientation in {"LeftTop", "RightTop", "RightBottom", "LeftBottom"}:
+        width, height = height, width
+    target = target_size(args, width, height)
+    canvas = geometry(target)
+    dest = (args.output.expanduser().absolute() if args.output else
+            source.with_name(f"{source.stem}-{canvas}.png"))
+    ext = dest.suffix.lower()
+    if ext not in OUTPUTS:
+        raise ValueError("choose a .png, .jpg, .jpeg, or .webp output")
+    if args.quality and (ext == ".png" or args.quality > 100):
+        raise ValueError("--quality accepts 1 to 100 for JPEG and WebP")
+    if args.dpi and (ext == ".webp" or args.dpi > 65535):
+        raise ValueError("--dpi accepts 1 to 65535 for PNG and JPEG")
+    if args.background == "transparent" and ext in {".jpg", ".jpeg"}:
+        raise ValueError("choose PNG or WebP for a transparent background")
+    if dest.exists() and dest.samefile(source):
+        raise ValueError("choose an output path different from the input")
+    if os.path.lexists(dest) and not args.force:
+        raise ValueError(f"output already exists: {dest}\nChoose another output path or pass --force.")
+
+    crop = []
+    if args.fit == "crop":
+        factor = max(Fraction(target[0], width), Fraction(target[1], height))
+        width, height = math.ceil(target[0] / factor), math.ceil(target[1] / factor)
+        crop = ["-gravity", "center", "-crop", f"{width}x{height}+0+0", "+repage"]
+    color = ["-profile", SRGB] if "icc" in profiles.lower() else ["-colorspace", "sRGB"]
+    image = work / "prepared.png"
+    magick(first, "-auto-orient", "+repage", *crop, *color, "-strip", "-depth", "8",
+           "-define", "png:compression-level=1", image)
+
+    ratios = (Fraction(target[0], width), Fraction(target[1], height))
+    factor = max(ratios) if args.fit == "crop" else min(ratios)
+    if factor > 1:
+        print(f"Upscaling with {args.model} for a {canvas} output.", file=sys.stderr, flush=True)
+        image = enhance(image, (width, height), args.model, work)
+    else:
+        print(f"Source has enough pixels for {canvas}. Resizing and framing locally.", file=sys.stderr)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".upscale-", dir=dest.parent) as staging:
+        encoded = Path(staging) / ("output" + ext)
+        background = "none" if args.background == "transparent" else args.background
+        resize = canvas + ("^" if args.fit == "crop" else "")
+        options = ["-filter", "Lanczos", "-resize", resize, "-gravity", "center",
+                   "-background", background, "-compose", "Copy", "-extent", canvas, "+repage"]
+        if ext in {".jpg", ".jpeg"}:
+            options.extend(["-alpha", "remove", "-alpha", "off"])
+        if ext != ".png":
+            options.extend(["-quality", str(args.quality or 92)])
+        if args.dpi:
+            options.extend(["-units", "PixelsPerInch", "-density", str(args.dpi)])
+        magick(image, *options, "-depth", "8", "-profile", SRGB, encoded)
+        actual = magick("-ping", encoded, "-format", "%wx%h", "info:")
+        if actual != canvas:
+            raise ValueError(f"expected {canvas} output, encoder produced {actual}")
+        if args.force:
+            os.replace(encoded, dest)
+        else:
+            os.link(encoded, dest)  # Atomic no-clobber publication on the destination volume.
+    return dest
+
+
+def main():
+    args = arguments()
+    try:
+        with tempfile.TemporaryDirectory(prefix="upscale-") as work:
+            print(process(args, Path(work)))
+    except (OSError, ValueError) as error:
+        sys.exit(f"upscale: {error}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+/bin/
+/models/
+/.install.*/
+/.venv/
+/examples/*-upscaled.png
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
